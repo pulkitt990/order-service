@@ -2,13 +2,16 @@
 # Stage 1: Builder
 # Installs dependencies into a clean virtual environment
 # ─────────────────────────────────────────────────────────────
-FROM python:3.12-slim AS builder
+FROM python:3.12-slim-bookworm AS builder
 
 # Don't write .pyc files, don't buffer stdout
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
 WORKDIR /build
+
+# Patch OS-level packages to reduce CVE surface
+RUN apt-get update && apt-get upgrade -y --no-install-recommends && rm -rf /var/lib/apt/lists/*
 
 # Install deps first (layer-cached unless requirements.txt changes)
 COPY requirements.txt .
@@ -20,9 +23,12 @@ RUN pip install --upgrade pip && \
 # Stage 2: Runtime
 # Minimal final image — no build tools, no pip, no cache
 # ─────────────────────────────────────────────────────────────
-FROM python:3.12-slim AS runtime
+FROM python:3.12-slim-bookworm AS runtime
 
 # Security: run as non-root user
+# Patch OS packages in runtime stage too
+RUN apt-get update && apt-get upgrade -y --no-install-recommends && rm -rf /var/lib/apt/lists/*
+
 RUN groupadd --gid 1001 appuser && \
     useradd --uid 1001 --gid appuser --shell /bin/bash --create-home appuser
 
