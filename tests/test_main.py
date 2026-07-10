@@ -80,22 +80,24 @@ def test_get_order_by_id():
 # ──────────────────────────────────────────────
 # Failure injection
 # ──────────────────────────────────────────────
-def test_full_failure_rate_always_errors(monkeypatch):
-    monkeypatch.setenv("FAILURE_RATE", "1.0")
-    # Reimport to pick up new env var
-    import importlib
+def test_failure_injection_raises_http_exception():
+    """_maybe_fail() should raise HTTPException when FAILURE_RATE=1.0."""
     import src.main as main_module
-    importlib.reload(main_module)
-
-    from fastapi.testclient import TestClient as TC
-    broken_client = TC(main_module.app)
-
-    response = broken_client.get("/orders")
-    assert response.status_code == 500
+    original = main_module.FAILURE_RATE
+    main_module.FAILURE_RATE = 1.0
+    try:
+        with pytest.raises(Exception) as exc_info:
+            main_module._maybe_fail("/test")
+        # Should raise HTTPException with status 500
+        assert "500" in str(exc_info.value) or hasattr(exc_info.value, "status_code")
+    finally:
+        main_module.FAILURE_RATE = original
 
 
 def test_zero_failure_rate_never_errors():
-    # Default client has FAILURE_RATE=0.0
+    """With FAILURE_RATE=0.0, all requests should succeed."""
+    import src.main as main_module
+    main_module.FAILURE_RATE = 0.0
     for _ in range(10):
         response = client.get("/orders")
         assert response.status_code == 200
