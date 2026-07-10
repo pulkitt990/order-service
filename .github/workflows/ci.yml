@@ -1,0 +1,230 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# CI Pipeline: Self-Healing GitOps Demo — Order Service
+#
+# Triggers on every push/PR to main.
+# Jobs (run in order):
+#   1. test        → Install deps, run pytest
+#   2. scan        → Build image, run Trivy vulnerability scan
+#   3. publish     → Push image to GHCR (only on push to main)
+#   4. update-gitops → Patch image tag in GitOps config repo (only on main)
+# ──────────────────────────────────────────────────────────────────────────────
+name: CI — Build · Test · Scan · Push
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'requirements.txt'
+      - 'Dockerfile'
+      - '.github/workflows/**'
+  pull_request:
+    branches: [main]
+
+# Cancel any in-progress run for the same branch/PR
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # GitHub Container Registry — free, no DockerHub rate limits
+  REGISTRY: ghcr.io
+  # e.g.  ghcr.io/pulkit/order-service
+  IMAGE_NAME: ${{ github.repository_owner }}/order-service
+
+jobs:
+  # ────────────────────────────────────────────
+  # JOB 1 — Run unit tests
+  # ────────────────────────────────────────────
+  test:
+    name: 🧪 Unit Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio httpx
+
+      - name: Run tests
+        run: pytest tests/ -v --tb=short
+
+  # ────────────────────────────────────────────
+  # JOB 2 — Build image + Trivy vulnerability scan
+  # Runs on both push and PR so PRs are scanned too
+  # ────────────────────────────────────────────
+  scan:
+    name: 🔍 Build & Trivy Scan
+    runs-on: ubuntu-latest
+    needs: test   # only scan if tests pass
+
+    permissions:
+      contents: read
+      security-events: write   # needed to upload SARIF results
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (local, not pushed yet)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          load: true          # load into local Docker daemon for scanning
+          tags: order-service:scan-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: order-service:scan-${{ github.sha }}
+          format: sarif
+          output: trivy-results.sarif
+          # Fail the pipeline on CRITICAL or HIGH vulnerabilities
+          severity: CRITICAL,HIGH
+          exit-code: '1'
+          ignore-unfixed: true  # don't fail on CVEs with no fix available
+
+      - name: Upload Trivy SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()   # upload even if scan failed, so you can see results
+        with:
+          sarif_file: trivy-results.sarif
+
+  # ────────────────────────────────────────────
+  # JOB 3 — Push image to GHCR
+  # Only runs on direct pushes to main (not PRs)
+  # ────────────────────────────────────────────
+  publish:
+    name: 📦 Push to GHCR
+    runs-on: ubuntu-latest
+    needs: [test, scan]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    permissions:
+      contents: read
+      packages: write   # needed to push to GHCR
+
+    outputs:
+      image-tag: ${{ steps.meta.outputs.version }}
+      image-digest: ${{ steps.build-push.outputs.digest }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata (tags + labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            # Tag with short git SHA: ghcr.io/you/order-service:abc1234
+            type=sha,prefix=,format=short
+            # Tag with semver if you push a git tag like v1.2.3
+            type=semver,pattern={{version}}
+            # Always update the 'latest' tag on main
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push image to GHCR
+        id: build-push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Re-use the build cache from the scan job
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # Build provenance attestation (supply chain security)
+          provenance: true
+          sbom: true
+
+      - name: Print image details
+        run: |
+          echo "✅ Image pushed:"
+          echo "   Tags:   ${{ steps.meta.outputs.tags }}"
+          echo "   Digest: ${{ steps.build-push.outputs.digest }}"
+
+  # ────────────────────────────────────────────
+  # JOB 4 — Update image tag in GitOps config repo
+  # This triggers ArgoCD to detect the change and deploy
+  # ────────────────────────────────────────────
+  update-gitops:
+    name: 🔄 Update GitOps Config Repo
+    runs-on: ubuntu-latest
+    needs: publish
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout GitOps config repo
+        uses: actions/checkout@v4
+        with:
+          # This is your SECOND repo (the config/manifests repo)
+          # Set GITOPS_REPO_URL secret to: https://github.com/YOUR_USERNAME/gitops-selfhealing-config
+          repository: ${{ secrets.GITOPS_REPO_NAME }}
+          token: ${{ secrets.GITOPS_PAT }}   # Personal Access Token with repo write
+
+      - name: Set up image tag
+        id: tag
+        run: |
+          # Short SHA is what we tagged the image with
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          echo "tag=${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "Image tag will be: ${SHORT_SHA}"
+
+      - name: Patch image tag in rollout manifest
+        run: |
+          SHORT_SHA=${{ steps.tag.outputs.tag }}
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${SHORT_SHA}"
+
+          echo "Updating image to: ${IMAGE}"
+
+          # Use sed to replace the image line in the Rollout manifest
+          sed -i "s|image: .*order-service.*|image: ${IMAGE}|g" \
+            apps/order-service/rollout.yaml
+
+          echo "Updated rollout.yaml:"
+          grep "image:" apps/order-service/rollout.yaml
+
+      - name: Commit and push updated manifest
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add apps/order-service/rollout.yaml
+          git commit -m "chore: update order-service image to ${{ steps.tag.outputs.tag }}
+
+          Triggered by: ${{ github.repository }}@${{ github.sha }}
+          Actor: ${{ github.actor }}
+          Workflow: ${{ github.workflow }}"
+
+          git push origin main
+          echo "✅ GitOps repo updated — ArgoCD will detect this change shortly"
